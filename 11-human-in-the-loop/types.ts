@@ -125,6 +125,15 @@ export const ApprovalRecordSchema = z.object({
   originalRequest: z.string(),
   proposedAction: ProposedActionSchema,
   status: ApprovalStatusSchema,
+  // Content-binding fields (see utils.ts `hashAction`). An approval binds to
+  // one exact {toolName, arguments} payload, not to the record ID: `argsHash`
+  // is that payload's hash, `revision` counts edits, and `approvedArgsHash` is
+  // the hash a human actually approved — set only once the record moves to
+  // `approved`, and compared against the stored hash before every execution.
+  revision: z.number().int().positive(),
+  argsHash: z.string().length(64),
+  approvedArgsHash: z.string().length(64).optional(),
+  approvedAt: z.string().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
   decisionReason: z.string().optional(),
@@ -141,6 +150,7 @@ export const ExecutionRecordSchema = z.object({
   approvalId: z.string(),
   toolName: ToolNameSchema,
   arguments: z.record(z.unknown()),
+  argsHash: z.string().length(64),
   result: z.record(z.unknown()),
   executedAt: z.string(),
 });
@@ -161,6 +171,8 @@ export const AuditEventTypeSchema = z.enum([
   "ACTION_EXECUTED",
   "DUPLICATE_EXECUTION_BLOCKED",
   "EXISTING_EXECUTION_RECOVERED",
+  "APPROVAL_BINDING_MISMATCH",
+  "EXECUTION_BINDING_MISMATCH",
 ]);
 export type AuditEventType = z.infer<typeof AuditEventTypeSchema>;
 

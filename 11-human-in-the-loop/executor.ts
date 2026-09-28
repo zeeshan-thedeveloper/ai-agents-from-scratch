@@ -1,5 +1,6 @@
 import { appendAudit } from "./auditLog.js";
 import {
+  findApproval,
   findExecutionByApprovalId,
   nextExecutionId,
   nextResultId,
@@ -8,8 +9,7 @@ import {
 import type { DataPaths } from "./config.js";
 import { evaluatePolicy } from "./policy.js";
 import { RESULT_ID_PREFIX, runTool } from "./tools.js";
-import type { ApprovalRecord } from "./types.js";
-import { nowIso } from "./utils.js";
+import { hashAction, nowIso } from "./utils.js";
 
 export interface ExecutionOutcome {
   executionId: string;
@@ -20,24 +20,38 @@ export interface ExecutionOutcome {
 }
 
 /**
- * Execute the tool behind a record exactly once (locally) and record it.
+ * Execute the tool behind an approval exactly once (locally) and record it.
  *
  * This is the last gate before a side effect, and it defends the control
- * boundary independently of the approval service — a direct call cannot bypass
- * it:
+ * boundary independently of the approval service — it takes only an ID and
+ * always reloads the record from the store itself. It never trusts a record
+ * object handed to it by a caller, so a caller cannot forge permission by
+ * constructing an object with `status: "approved"` and different arguments.
  *
  *  1. a tool denied by policy never executes;
  *  2. an approval-required tool only executes from an `approved` record — a
  *     pending or rejected record is refused here, not just in the service;
  *  3. if an execution already exists for this approval, the tool is NOT called
- *     again; the existing result is reused (local idempotency by approval ID).
+ *     again — but the existing execution is only reused if its arguments still
+ *     match what was approved;
+ *  4. content binding: right before the side effect, the stored arguments are
+ *     re-hashed and compared against `approvedArgsHash`. Any mismatch — a
+ *     missing hash (a forged or manually-upserted record) or a hash that no
+ *     longer matches (the stored arguments were tampered with after approval)
+ *     — refuses execution. Nothing runs, nothing is recorded, and the
+ *     mismatch is audited.
  *
  * This is local idempotency, not a distributed exactly-once guarantee.
  */
 export function executeAction(
   paths: DataPaths,
-  approval: ApprovalRecord
+  approvalId: string
 ): ExecutionOutcome {
+  const approval = findApproval(paths, approvalId);
+  if (!approval) {
+    throw new Error(`No approval found with id "${approvalId}".`);
+  }
+
   const { toolName, arguments: args } = approval.proposedAction;
   const policy = evaluatePolicy(toolName);
 
@@ -57,9 +71,25 @@ export function executeAction(
   }
 
   // Boundary 3 (local idempotency): reuse an existing execution for this
-  // approval. The execution record is the durable proof the tool already ran.
+  // approval — but only if its recorded payload still matches what was
+  // approved. An execution that no longer matches is never silently replayed.
   const existing = findExecutionByApprovalId(paths, approval.id);
   if (existing) {
+    if (!approval.approvedArgsHash || existing.argsHash !== approval.approvedArgsHash) {
+      appendAudit(paths, {
+        event: "EXECUTION_BINDING_MISMATCH",
+        approvalId: approval.id,
+        toolName,
+        metadata: {
+          expected: approval.approvedArgsHash,
+          actual: existing.argsHash,
+          stage: "reuse",
+        },
+      });
+      throw new Error(
+        `Refusing to reuse execution ${existing.id} for ${approval.id}: its recorded arguments do not match the approved payload.`
+      );
+    }
     appendAudit(paths, {
       event: "EXISTING_EXECUTION_RECOVERED",
       approvalId: approval.id,
@@ -67,6 +97,29 @@ export function executeAction(
       metadata: { executionId: existing.id },
     });
     return { executionId: existing.id, result: existing.result, recovered: true };
+  }
+
+  // Boundary 4 (content binding, independent of the caller): recompute the
+  // hash of the stored proposedAction and refuse to run unless it exactly
+  // matches `approvedArgsHash`. This is what stops a forged or tampered
+  // record — status flipped to "approved" directly in the store, with
+  // different arguments, or with no approvedArgsHash at all — from ever
+  // reaching runTool.
+  const argsHash = hashAction(toolName, args);
+  if (!approval.approvedArgsHash || argsHash !== approval.approvedArgsHash) {
+    appendAudit(paths, {
+      event: "EXECUTION_BINDING_MISMATCH",
+      approvalId: approval.id,
+      toolName,
+      metadata: {
+        expected: approval.approvedArgsHash,
+        actual: argsHash,
+        stage: "pre-execution",
+      },
+    });
+    throw new Error(
+      `Refusing to execute "${toolName}" for ${approval.id}: stored arguments do not match the approved payload.`
+    );
   }
 
   const executionId = nextExecutionId(paths);
@@ -80,15 +133,20 @@ export function executeAction(
     approvalId: approval.id,
     toolName,
     arguments: args,
+    argsHash,
     result,
     executedAt: nowIso(),
   });
 
+  // `argsHash` is the content identity of what actually ran. In a real
+  // payment integration, this is what you'd send downstream as the
+  // idempotency key, so a retried call is deduplicated by content — not just
+  // by approval ID, which a stale-view edit could have quietly changed.
   appendAudit(paths, {
     event: "ACTION_EXECUTED",
     approvalId: approval.id,
     toolName,
-    metadata: { executionId, result },
+    metadata: { executionId, result, argsHash },
   });
 
   return { executionId, result, recovered: false };

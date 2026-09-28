@@ -15,10 +15,12 @@ import {
   upsertApproval,
 } from "../approvalStore.js";
 import { loadAudit } from "../auditLog.js";
+import { resolveExpectedHash } from "../cli.js";
 import type { DataPaths } from "../config.js";
 import { executeAction } from "../executor.js";
 import { evaluatePolicy } from "../policy.js";
 import { ActionProposalSchema, type ApprovalRecord } from "../types.js";
+import { hashAction } from "../utils.js";
 
 // These tests exercise the workflow with NO model calls and NO OpenAI key.
 // Every test gets its own temporary data directory so the committed demo files
@@ -89,6 +91,7 @@ test("refund proposal creates a pending approval and does not execute", () => {
   const approvals = loadApprovals(paths);
   assert.equal(approvals.length, 1);
   assert.equal(approvals[0].status, "pending");
+  assert.equal(approvals[0].revision, 1);
   assert.equal(loadExecutions(paths).length, 0);
 });
 
@@ -98,7 +101,7 @@ test("approving a valid pending refund executes it once", () => {
   const { record } = handleProposal(paths, REFUND_REQUEST, refundProposal()) as {
     record: ApprovalRecord;
   };
-  const result = approveApproval(paths, record.id);
+  const result = approveApproval(paths, record.id, record.argsHash);
   assert.equal(result.blocked, false);
   assert.equal(result.record.status, "executed");
   const executions = loadExecutions(paths);
@@ -112,8 +115,8 @@ test("approving the same record again does not execute twice", () => {
   const { record } = handleProposal(paths, REFUND_REQUEST, refundProposal()) as {
     record: ApprovalRecord;
   };
-  approveApproval(paths, record.id);
-  const second = approveApproval(paths, record.id);
+  approveApproval(paths, record.id, record.argsHash);
+  const second = approveApproval(paths, record.id, record.argsHash);
   assert.equal(second.blocked, true);
   assert.equal(loadExecutions(paths).length, 1);
   assert.equal(loadApprovals(paths)[0].status, "executed");
@@ -128,7 +131,7 @@ test("rejecting a pending action prevents execution", () => {
   const rejected = rejectApproval(paths, record.id, "Customer is not eligible");
   assert.equal(rejected.status, "rejected");
   assert.equal(loadExecutions(paths).length, 0);
-  assert.throws(() => approveApproval(paths, record.id), /not "pending"/);
+  assert.throws(() => approveApproval(paths, record.id, record.argsHash), /not "pending"/);
 });
 
 // 9: editing a pending refund to €49 succeeds.
@@ -137,13 +140,16 @@ test("editing a pending refund to €49 succeeds", () => {
   const { record } = handleProposal(paths, REFUND_REQUEST, refundProposal()) as {
     record: ApprovalRecord;
   };
-  const { after } = editApproval(paths, record.id, {
-    amount: "49",
-    reason: "Partial refund approved after review",
-  });
+  const { after } = editApproval(
+    paths,
+    record.id,
+    { amount: "49", reason: "Partial refund approved after review" },
+    record.argsHash
+  );
   assert.equal(after.amount, 49);
   assert.equal(loadApprovals(paths)[0].status, "pending");
   assert.equal(loadApprovals(paths)[0].proposedAction.arguments.amount, 49);
+  assert.equal(loadApprovals(paths)[0].revision, 2);
 });
 
 // 10: editing a refund to a negative amount fails validation.
@@ -152,9 +158,10 @@ test("editing a refund to a negative amount fails validation", () => {
   const { record } = handleProposal(paths, REFUND_REQUEST, refundProposal()) as {
     record: ApprovalRecord;
   };
-  assert.throws(() => editApproval(paths, record.id, { amount: "-10" }));
+  assert.throws(() => editApproval(paths, record.id, { amount: "-10" }, record.argsHash));
   // The record is unchanged and still valid.
   assert.equal(loadApprovals(paths)[0].proposedAction.arguments.amount, 79);
+  assert.equal(loadApprovals(paths)[0].revision, 1);
 });
 
 // 11: editing protected approval fields is not allowed.
@@ -164,11 +171,15 @@ test("editing protected approval fields is not allowed", () => {
     record: ApprovalRecord;
   };
   assert.throws(
-    () => editApproval(paths, record.id, { status: "executed" }),
+    () => editApproval(paths, record.id, { status: "executed" }, record.argsHash),
     /protected field/
   );
   assert.throws(
-    () => editApproval(paths, record.id, { id: "APR-999" }),
+    () => editApproval(paths, record.id, { id: "APR-999" }, record.argsHash),
+    /protected field/
+  );
+  assert.throws(
+    () => editApproval(paths, record.id, { argsHash: "deadbeef" }, record.argsHash),
     /protected field/
   );
 });
@@ -185,7 +196,10 @@ test("a denied action never reaches a tool executor", () => {
   assert.equal(loadApprovals(paths).length, 0);
   assert.equal(loadExecutions(paths).length, 0);
 
-  // Defense in depth: even a direct executor call is refused.
+  // Defense in depth: even a direct executor call is refused, for a record
+  // that is actually in the store (the executor now reloads by ID and cannot
+  // be handed an in-memory object at all).
+  const now = new Date().toISOString();
   const forgedRecord: ApprovalRecord = {
     id: "APR-999",
     originalRequest: "forged",
@@ -195,10 +209,13 @@ test("a denied action never reaches a tool executor", () => {
       reason: "forged",
     },
     status: "pending",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    revision: 1,
+    argsHash: hashAction("deleteProductionUsers", {}),
+    createdAt: now,
+    updatedAt: now,
   };
-  assert.throws(() => executeAction(paths, forgedRecord), /denied by policy/);
+  upsertApproval(paths, forgedRecord);
+  assert.throws(() => executeAction(paths, forgedRecord.id), /denied by policy/);
 });
 
 // 13: approval data survives store reloading.
@@ -220,9 +237,9 @@ test("expected audit events are written in the correct lifecycle", () => {
   const { record } = handleProposal(paths, REFUND_REQUEST, refundProposal()) as {
     record: ApprovalRecord;
   };
-  editApproval(paths, record.id, { amount: "49" });
-  approveApproval(paths, record.id);
-  approveApproval(paths, record.id); // duplicate → blocked
+  const { record: edited } = editApproval(paths, record.id, { amount: "49" }, record.argsHash);
+  approveApproval(paths, record.id, edited.argsHash);
+  approveApproval(paths, record.id, edited.argsHash); // duplicate → blocked
 
   const events = loadAudit(paths).map((e) => e.event);
   assert.deepEqual(events, [
@@ -252,7 +269,7 @@ test("pending refund cannot bypass human approval through the executor", () => {
     record: ApprovalRecord;
   };
   assert.equal(record.status, "pending");
-  assert.throws(() => executeAction(paths, record), /human approval|required.*approved/i);
+  assert.throws(() => executeAction(paths, record.id), /human approval|required.*approved/i);
   assert.equal(loadExecutions(paths).length, 0);
 });
 
@@ -264,7 +281,7 @@ test("rejected refund cannot execute directly through the executor", () => {
   };
   const rejected = rejectApproval(paths, record.id, "Customer is not eligible");
   assert.equal(rejected.status, "rejected");
-  assert.throws(() => executeAction(paths, rejected), /human approval|approved/i);
+  assert.throws(() => executeAction(paths, rejected.id), /human approval|approved/i);
   assert.equal(loadExecutions(paths).length, 0);
 });
 
@@ -274,12 +291,18 @@ test("executor accepts an approved refund record", () => {
   const { record } = handleProposal(paths, REFUND_REQUEST, refundProposal()) as {
     record: ApprovalRecord;
   };
-  const approved: ApprovalRecord = { ...record, status: "approved" };
+  const approved: ApprovalRecord = {
+    ...record,
+    status: "approved",
+    approvedArgsHash: record.argsHash,
+    approvedAt: new Date().toISOString(),
+  };
   upsertApproval(paths, approved);
-  const outcome = executeAction(paths, approved);
+  const outcome = executeAction(paths, approved.id);
   assert.equal(outcome.recovered, false);
   assert.equal(outcome.result.status, "processed");
   assert.equal(loadExecutions(paths).length, 1);
+  assert.equal(loadExecutions(paths)[0].argsHash, record.argsHash);
 });
 
 // 19: a model-supplied permission field is rejected by the proposal schema.
@@ -300,13 +323,18 @@ test("an existing execution is reused rather than duplicated", () => {
   };
   // Simulate a crash: the record is approved and the tool ran (an execution is
   // saved), but the status was never flipped to "executed".
-  const approved: ApprovalRecord = { ...record, status: "approved" };
+  const approved: ApprovalRecord = {
+    ...record,
+    status: "approved",
+    approvedArgsHash: record.argsHash,
+    approvedAt: new Date().toISOString(),
+  };
   upsertApproval(paths, approved);
-  const firstRun = executeAction(paths, approved);
+  const firstRun = executeAction(paths, approved.id);
   assert.equal(firstRun.recovered, false);
 
   // Retrying approval must NOT call the tool again.
-  const retry = approveApproval(paths, record.id);
+  const retry = approveApproval(paths, record.id, record.argsHash);
   assert.equal(retry.blocked, false);
   assert.equal(retry.execution?.recovered, true);
   assert.equal(retry.execution?.executionId, firstRun.executionId);
@@ -339,21 +367,24 @@ test("policy mismatch blocks approval", () => {
   // A stored pending approval whose tool is classified auto_execute, not
   // require_approval — a stale workflow the current policy no longer matches.
   const now = new Date().toISOString();
+  const args = { orderId: "ORD-001" };
   const stale: ApprovalRecord = {
     id: "APR-001",
     originalRequest: "Check the status of order ORD-001.",
     proposedAction: {
       toolName: "getOrderStatus",
-      arguments: { orderId: "ORD-001" },
+      arguments: args,
       reason: "Look up the order status.",
     },
     status: "pending",
+    revision: 1,
+    argsHash: hashAction("getOrderStatus", args),
     createdAt: now,
     updatedAt: now,
   };
   upsertApproval(paths, stale);
   assert.throws(
-    () => approveApproval(paths, "APR-001"),
+    () => approveApproval(paths, "APR-001", stale.argsHash),
     /no longer classified as require_approval/
   );
   assert.equal(loadExecutions(paths).length, 0);
@@ -371,6 +402,161 @@ test("denied action writes ACTION_DENIED and creates no records", () => {
   assert.deepEqual(events, ["ACTION_PROPOSED", "POLICY_EVALUATED", "ACTION_DENIED"]);
   assert.equal(loadApprovals(paths).length, 0);
   assert.equal(loadExecutions(paths).length, 0);
+});
+
+// ── content-binding tests (approval binds to content, not the record) ───────
+
+// 24: canonical hash is key-order independent.
+test("canonical hash is key-order independent", () => {
+  const h1 = hashAction("refundOrder", {
+    orderId: "ORD-001",
+    amount: 49,
+    currency: "EUR",
+    reason: "x",
+  });
+  const h2 = hashAction("refundOrder", {
+    reason: "x",
+    currency: "EUR",
+    amount: 49,
+    orderId: "ORD-001",
+  });
+  assert.equal(h1, h2);
+  assert.equal(h1.length, 64);
+});
+
+// 25: approving with the correct post-edit hash executes the edited amount.
+test("approve with the correct hash after an edit executes the edited amount", () => {
+  const paths = tempPaths();
+  const { record } = handleProposal(paths, REFUND_REQUEST, refundProposal()) as {
+    record: ApprovalRecord;
+  };
+  const { record: edited } = editApproval(paths, record.id, { amount: "49" }, record.argsHash);
+  const outcome = approveApproval(paths, record.id, edited.argsHash);
+  assert.equal(outcome.record.status, "executed");
+  const execution = loadExecutions(paths)[0];
+  assert.equal(execution.result.amount, 49);
+  assert.equal(execution.argsHash, outcome.record.approvedArgsHash);
+});
+
+// 26: stale-view race — the €49/€79 two-reviewer scenario.
+test("stale-view race: approving with the pre-edit hash is refused, nothing executes", () => {
+  const paths = tempPaths();
+  const { record } = handleProposal(paths, REFUND_REQUEST, refundProposal()) as {
+    record: ApprovalRecord;
+  };
+  const staleHash = record.argsHash; // what reviewer A is looking at (€79)
+  editApproval(paths, record.id, { amount: "49" }, staleHash); // reviewer B edits to €49
+
+  assert.throws(
+    () => approveApproval(paths, record.id, staleHash), // reviewer A approves the €79 they saw
+    /changed since you reviewed it/
+  );
+
+  const current = loadApprovals(paths)[0];
+  assert.equal(current.status, "pending");
+  assert.equal(loadExecutions(paths).length, 0);
+  const events = loadAudit(paths).map((e) => e.event);
+  assert.ok(events.includes("APPROVAL_BINDING_MISMATCH"));
+});
+
+// 27: editing with a stale expected hash is refused and leaves arguments unchanged.
+test("editing with a stale expected hash is refused", () => {
+  const paths = tempPaths();
+  const { record } = handleProposal(paths, REFUND_REQUEST, refundProposal()) as {
+    record: ApprovalRecord;
+  };
+  editApproval(paths, record.id, { amount: "49" }, record.argsHash); // revision 2 now
+  assert.throws(
+    () => editApproval(paths, record.id, { amount: "10" }, record.argsHash), // stale (revision-1) hash
+    /changed since you reviewed it/
+  );
+  assert.equal(loadApprovals(paths)[0].proposedAction.arguments.amount, 49);
+  assert.equal(loadApprovals(paths)[0].revision, 2);
+});
+
+// 28: tampered store — arguments changed after approval, before execution runs.
+test("tampered store: executor refuses when stored arguments no longer match the approved hash", () => {
+  const paths = tempPaths();
+  const { record } = handleProposal(paths, REFUND_REQUEST, refundProposal()) as {
+    record: ApprovalRecord;
+  };
+  const approved: ApprovalRecord = {
+    ...record,
+    status: "approved",
+    approvedArgsHash: record.argsHash, // bound to the €79 payload
+    approvedAt: new Date().toISOString(),
+  };
+  upsertApproval(paths, approved);
+
+  // Tamper with the stored arguments directly, before executeAction ever runs.
+  const tampered: ApprovalRecord = {
+    ...approved,
+    proposedAction: {
+      ...approved.proposedAction,
+      arguments: { ...approved.proposedAction.arguments, amount: 999 },
+    },
+  };
+  upsertApproval(paths, tampered);
+
+  assert.throws(() => executeAction(paths, tampered.id), /do not match the approved payload/);
+  assert.equal(loadExecutions(paths).length, 0, "runTool must never have been called");
+  assert.notEqual(loadApprovals(paths)[0].status, "executed");
+  const events = loadAudit(paths).map((e) => e.event);
+  assert.ok(events.includes("EXECUTION_BINDING_MISMATCH"));
+});
+
+// 29: forged record — approved with no approvedArgsHash at all.
+test("forged record with status approved but no approvedArgsHash is refused", () => {
+  const paths = tempPaths();
+  const { record } = handleProposal(paths, REFUND_REQUEST, refundProposal()) as {
+    record: ApprovalRecord;
+  };
+  const forged: ApprovalRecord = { ...record, status: "approved" }; // no approvedArgsHash
+  upsertApproval(paths, forged);
+  assert.throws(() => executeAction(paths, forged.id), /do not match the approved payload/);
+  assert.equal(loadExecutions(paths).length, 0);
+});
+
+// 30: stored argsHash inconsistent with stored arguments (integrity) → approve refuses.
+test("stored argsHash inconsistent with stored arguments is refused at approval", () => {
+  const paths = tempPaths();
+  const { record } = handleProposal(paths, REFUND_REQUEST, refundProposal()) as {
+    record: ApprovalRecord;
+  };
+  // argsHash is left as the original (€79) hash while the arguments are
+  // changed underneath it directly in the store — an integrity violation.
+  const corrupted: ApprovalRecord = {
+    ...record,
+    proposedAction: {
+      ...record.proposedAction,
+      arguments: { ...record.proposedAction.arguments, amount: 999 },
+    },
+  };
+  upsertApproval(paths, corrupted);
+  assert.throws(() => approveApproval(paths, record.id, record.argsHash), /changed since you reviewed it/);
+  assert.equal(loadApprovals(paths)[0].status, "pending");
+  assert.equal(loadExecutions(paths).length, 0);
+});
+
+// 31: auto_execute sets approvedArgsHash from policy and still executes.
+test("auto_execute sets approvedArgsHash from policy and executes", () => {
+  const paths = tempPaths();
+  const outcome = handleProposal(paths, "Check the status of order ORD-001.", {
+    toolName: "getOrderStatus",
+    arguments: { orderId: "ORD-001" },
+    reason: "Look up the order status.",
+  });
+  assert.equal(outcome.kind, "auto_executed");
+  if (outcome.kind !== "auto_executed") throw new Error("unreachable");
+  assert.equal(outcome.record.status, "executed");
+  assert.equal(outcome.record.approvedArgsHash, outcome.record.argsHash);
+  assert.equal(loadExecutions(paths)[0].argsHash, outcome.record.approvedArgsHash);
+});
+
+// 32: the CLI's hash-prefix parsing helper rejects prefixes under 12 characters.
+test("CLI rejects an --expect prefix shorter than 12 characters", () => {
+  const paths = tempPaths();
+  assert.throws(() => resolveExpectedHash(paths, "APR-001", "short"), /at least 12/);
 });
 
 // ── summary ──────────────────────────────────────────────────────────────────

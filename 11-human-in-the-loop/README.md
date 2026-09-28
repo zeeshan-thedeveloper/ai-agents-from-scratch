@@ -30,15 +30,15 @@ Deterministic policy gate    (application code, not the model)
     ↓
 auto_execute | require_approval | deny
     ↓
-Persistent approval record   (survives process restarts)
+Persistent approval record   (content hash of {toolName, arguments} is its identity)
     ↓
-Human: approve | edit | reject
+Human: approve | edit | reject   (approve/edit must name the exact hash reviewed)
     ↓
-Re-validate action + policy  (edited arguments are checked again)
+Re-validate action + policy  (edited arguments are checked again, hash recomputed)
     ↓
 pending → approved → executed (permission granted before the side effect)
     ↓
-Tool execution               (reused if an execution already exists)
+Tool execution                (executor reloads by ID, refuses on any hash mismatch)
     ↓
 Audit log                    (durable record of the whole lifecycle)
 ```
@@ -89,13 +89,13 @@ Step by step:
 - **`index.ts`** — `npm start`. Prints the fixed request, calls the proposal agent, prints the proposal, runs the policy gate, creates the pending record, and confirms nothing executed. The only file that calls the model.
 - **`actionAgent.ts`** — `proposeAction(request)`. The single model call. A strict prompt asks for JSON with only `toolName`, `arguments`, and `reason` — it is explicitly forbidden from emitting any permission field. Returns a validated `ActionProposal`.
 - **`policy.ts`** — `evaluatePolicy(toolName)`. The deterministic gate: a typed table mapping each tool to `auto_execute | require_approval | deny`. Fails closed — an unclassified tool is denied.
-- **`types.ts`** — the contracts. A Zod discriminated union for the proposal, plus schemas for policy decisions, approval records, executions, and audit events.
-- **`approvalService.ts`** — the lifecycle orchestration: `handleProposal`, `editApproval`, `approveApproval`, `rejectApproval`, `resetDemo`. Ties the pieces together while keeping each responsibility in its own module.
-- **`executor.ts`** — `executeAction`. The last gate before a side effect. Independently defends the boundary: it refuses a `deny` tool, refuses an approval-required tool unless the record is `approved`, and reuses an existing execution for the approval instead of re-running. Otherwise it allocates a persisted execution ID, runs the mock tool, and writes the `ACTION_EXECUTED` audit event.
+- **`types.ts`** — the contracts. A Zod discriminated union for the proposal, plus schemas for policy decisions, approval records (`revision`, `argsHash`, `approvedArgsHash`), executions, and audit events (including `APPROVAL_BINDING_MISMATCH` / `EXECUTION_BINDING_MISMATCH`).
+- **`approvalService.ts`** — the lifecycle orchestration: `handleProposal`, `editApproval`, `approveApproval`, `rejectApproval`, `resetDemo`. Every edit or approval call takes the content hash the caller expects the record to have, and refuses with `ArgsHashMismatchError` if it doesn't match. Ties the pieces together while keeping each responsibility in its own module.
+- **`executor.ts`** — `executeAction(paths, approvalId)`. The last gate before a side effect, and an independent one: it takes only an ID and reloads the record itself, so it can never be handed a forged in-memory object. It refuses a `deny` tool, refuses an approval-required tool unless the record is `approved`, refuses to execute or reuse an execution whose content hash doesn't match `approvedArgsHash`, and otherwise allocates a persisted execution ID, runs the mock tool, and writes the `ACTION_EXECUTED` audit event with the content hash.
 - **`tools.ts`** — the mock business tools. Every result is marked `mock: true`. `deleteProductionUsers` has no working implementation and throws if called.
 - **`approvalStore.ts` / `auditLog.ts`** — JSON-file persistence for approvals, executions, and the audit trail, with deterministic sequential IDs (`APR-001`, `EXE-001`, `REF-001`).
-- **`cli.ts`** — the `list / edit / approve / reject / audit / reset` commands.
-- **`config.ts` / `utils.ts`** — model + path config, and helpers for validation, JSON stores, IDs, and console formatting.
+- **`cli.ts`** — the `list / edit / approve / reject / audit / reset` commands. `edit` and `approve` require `--expect=<hash>` (a full hash or a 12+ character prefix).
+- **`config.ts` / `utils.ts`** — model + path config, and helpers for validation, JSON stores, IDs, console formatting, and the canonical-JSON content hash (`canonicalJson`, `hashAction`).
 
 ## Run it
 
@@ -122,16 +122,24 @@ List pending approvals:
 npm run approvals
 ```
 
-Edit the proposed arguments before approval (human business decision):
+Edit the proposed arguments before approval (human business decision). `--expect` names the content hash you are editing from — copy it from `npm run approvals` (the 12-character prefix shown next to the record is enough):
 
 ```bash
-npm run edit -- APR-001 --amount=49 --reason="Partial refund approved after review"
+npm run edit -- APR-001 --amount=49 --expect=5e6c24d4e64b --reason="Partial refund approved after review"
 ```
 
-Approve and execute (once locally; a repeat approval is blocked or reused):
+The edit prints the new hash and the exact command to approve it:
+
+```text
+New hash: 2dabdfe0e8341eb0ad7b0a5e35b2f8106e96330e9f1a4aa7388f3ef42b929403
+Approve this exact version with:
+  npm run approve -- APR-001 --expect=2dabdfe0e834
+```
+
+Approve and execute (once locally; a repeat approval is blocked or reused). `--expect` must match the record's *current* hash — not the one you saw before someone else edited it:
 
 ```bash
-npm run approve -- APR-001
+npm run approve -- APR-001 --expect=2dabdfe0e834
 ```
 
 Reject instead (never executes):
@@ -236,6 +244,22 @@ Approval is enforced twice. The approval service controls the normal workflow, a
 
 Forbidden proposals are also visible in the trail: a `deny` decision writes an explicit `ACTION_DENIED` audit event and creates **no** approval record and **no** execution record.
 
+## Approval binds to content, not the record
+
+Binding approval to a record ID (`APR-001`) instead of to the exact payload a human reviewed opens two real gaps:
+
+**The stale-view race.** Reviewer A opens `APR-001` and sees a €49 refund. Before they click approve, reviewer B edits the same record to €79. If "approve" just means "flip whatever is stored at `APR-001` to approved," A's click authorizes €79 — a number they never saw. Nobody approved €79; the record ID just happened to still be the same.
+
+**The forged-object case.** `executeAction` used to take an `ApprovalRecord` object and check `status === "approved"` on *that object*. Nothing stopped a caller from building `{ ...anything, status: "approved" }` in memory and handing it straight to the executor, skipping the store entirely.
+
+The fix: every approval record carries `argsHash`, the sha256 of a canonical JSON encoding of `{ toolName, arguments }` (`hashAction` in `utils.ts` — key order doesn't affect the hash, only the content does). `revision` counts edits. Approving or editing requires the caller to name the exact hash they reviewed via `--expect`:
+
+- **`editApproval`** and **`approveApproval`** reload the record and compare its *current* `argsHash` against the caller's `expectedArgsHash` before doing anything. A mismatch throws `ArgsHashMismatchError`, audits `APPROVAL_BINDING_MISMATCH`, and leaves the record untouched. In the two-reviewer example, A's stale hash no longer matches the record B edited, so A's approval is refused — even though both requests named `APR-001`.
+- **`executeAction`** now takes only an `approvalId`, never a record object. It reloads the record from the store itself, recomputes the hash of the stored `proposedAction`, and refuses to run unless it exactly matches `approvedArgsHash` — auditing `EXECUTION_BINDING_MISMATCH` and calling `runTool` **zero times** on any mismatch. A forged object never reaches it (there's no object parameter to forge), and a record tampered with directly in the store *after* approval (arguments changed, status left as `"approved"`) is caught by this same check before the side effect runs.
+- Approving a stale or corrupted record never executes anything — it errors, audits the mismatch, and leaves the record `pending`.
+
+`argsHash` is also a preview of a pattern you'll want in production: it's exactly the kind of value you'd send downstream as an **idempotency key** to a real payment processor, so a retried call is deduplicated by *what* it does, not just by which internal record triggered it.
+
 ## The approval state machine
 
 A record moves through explicit, truthful states:
@@ -245,9 +269,9 @@ pending → approved → executed
                  ↘ rejected
 ```
 
-- **`pending`** — waiting for human review. Not executable.
-- **`approved`** — permission has been granted, but the side effect is not yet complete. Permission is persisted *before* the tool runs.
-- **`executed`** — the side effect completed and an execution record exists.
+- **`pending`** — waiting for human review. Not executable. Each edit re-validates the arguments, recomputes `argsHash`, and bumps `revision`.
+- **`approved`** — permission has been granted, but the side effect is not yet complete. Permission (and `approvedArgsHash`, the exact payload that was approved) is persisted *before* the tool runs.
+- **`executed`** — the side effect completed and an execution record exists, carrying the same `argsHash` that was approved.
 - **`rejected`** — execution is permanently blocked for that record; it can never be approved.
 
 The record is only marked `executed` after the tool succeeds. If execution throws, the record truthfully stays `approved` — never falsely `executed`. Auto-executable actions follow the same shape: they are authorized by policy (audited with `authorizedBy: "policy"`) rather than by a human (`authorizedBy: "human"`), but they still go `approved → executed` so a failed run is never recorded as done.
@@ -264,7 +288,7 @@ Approval must not mean "call the tool every time this command runs." The local e
 
 - the first valid approval executes the tool and moves the record to `executed`;
 - approving an already-`executed` record does **not** call the tool again — the duplicate is reported and audited as `DUPLICATE_EXECUTION_BLOCKED`, and the record stays `executed`;
-- if an execution record already exists for the approval but the record never advanced to `executed` (for example, the process died between saving the execution and flipping the status), the existing result is reconciled and reused, audited as `EXISTING_EXECUTION_RECOVERED` — the tool is **not** called again.
+- if an execution record already exists for the approval but the record never advanced to `executed` (for example, the process died between saving the execution and flipping the status), the existing result is reconciled and reused, audited as `EXISTING_EXECUTION_RECOVERED` — the tool is **not** called again, and only if that existing execution's content hash still matches what was approved (otherwise it's refused and audited as `EXECUTION_BINDING_MISMATCH` instead of silently reused).
 
 The execution record is the durable proof that a tool already ran, so this holds across a restart.
 
@@ -300,6 +324,8 @@ This example **is not**:
 - keep the denied tool defended in depth — policy denies it, the executor refuses it, and the tool itself has no implementation
 - always show the reviewer the **exact** proposed tool and arguments, and always re-validate edited arguments before executing
 - represent money using integer minor units (such as cents) or a dedicated decimal type rather than binary floating-point numbers — this example uses whole euros for readability, which is not safe for real currency arithmetic
+- this module's JSON store has no file locking, so two concurrent edits can still race at the filesystem level; a real system needs a transactional compare-and-set at the storage layer (e.g. `UPDATE approvals SET ... WHERE id = ? AND args_hash = ?`), not just an application-level hash check
+- sign or MAC approval tokens (the hash plus a reviewer identity, timestamp, and a server-held secret) so an approval is bound to *who* reviewed it, not only to *what* they reviewed — the content hash in this module stops a stale or forged payload, but on its own it doesn't prove which human approved it
 
 ## What you should understand after this
 
@@ -308,6 +334,7 @@ This example **is not**:
 - why a human must see the exact tool and arguments, and why edited arguments must be re-validated
 - why an approved action should run once locally, how a persisted execution record makes that hold across restarts, and why that is still not a distributed exactly-once guarantee
 - why approval records and audit logs are the durable spine of a control boundary — and how this sets up durable, resumable workflows
+- why an approval must bind to the exact content a human reviewed (a hash of the payload), not to a mutable record ID — and why the executor must reload and re-check that binding itself instead of trusting an object handed to it
 
 > A correct tool call is still only a proposal until the surrounding system gives it permission to run.
 
