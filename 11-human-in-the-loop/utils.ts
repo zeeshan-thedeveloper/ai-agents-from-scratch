@@ -1,6 +1,7 @@
 // Small helpers shared across the module: model-output validation, JSON-file
 // persistence, ID generation, and console formatting.
 
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
@@ -114,4 +115,44 @@ export function prettyJson(value: unknown): string {
 export function preview(value: unknown, max = 140): string {
   const text = typeof value === "string" ? value : JSON.stringify(value);
   return text.length <= max ? text : `${text.slice(0, max)}...`;
+}
+
+/**
+ * Deterministic JSON serialization: object keys are sorted recursively so the
+ * same logical value always produces the same string regardless of key
+ * insertion order. Arrays keep their order (order is meaningful there).
+ * `undefined` values are dropped, matching JSON.stringify's own behaviour for
+ * object properties.
+ */
+export function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalize(value));
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => canonicalize(item));
+  }
+  if (value !== null && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      const entry = (value as Record<string, unknown>)[key];
+      if (entry === undefined) continue;
+      sorted[key] = canonicalize(entry);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+/**
+ * Content hash of a proposed action: sha256 hex of the canonical JSON of
+ * `{ toolName, arguments }`. This is the identity of an approval's payload —
+ * two payloads with identical content hash identically regardless of key
+ * order, and any change to the content (a different amount, a different
+ * field) changes the hash. Approvals bind to this hash, not to a record ID.
+ */
+export function hashAction(toolName: string, args: Record<string, unknown>): string {
+  return createHash("sha256")
+    .update(canonicalJson({ toolName, arguments: args }))
+    .digest("hex");
 }
