@@ -1,0 +1,26 @@
+{
+  "name": "13-prompt-injection-tool-security",
+  "version": "1.0.0",
+  "description": "Prompt injection and tool security from scratch: an agent reads an attacker-controlled webpage, and an application-enforced policy decides which proposed tool calls may execute",
+  "type": "module",
+  "scripts": {
+    "start": "tsx index.ts",
+    "demo:normal": "tsx cli.ts normal",
+    "demo:unsafe": "tsx cli.ts unsafe",
+    "demo:protected": "tsx cli.ts protected",
+    "demo:prompt": "tsx cli.ts prompt",
+    "demo:live": "tsx cli.ts live",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx tests/runTests.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "openai": "^4.104.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}
