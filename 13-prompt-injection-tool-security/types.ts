@@ -187,6 +187,8 @@ export const AuditEventTypeSchema = z.enum([
   "TOOL_EXECUTION_BLOCKED",
   "TOOL_EXECUTION_FAILED",
   "SUMMARY_COMPLETED",
+  // An answer was produced before the target page was ever read.
+  "ANSWER_NOT_GROUNDED",
 ]);
 export type AuditEventType = z.infer<typeof AuditEventTypeSchema>;
 

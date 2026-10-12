@@ -62,7 +62,7 @@ function printComparison(rows: [string, ScenarioResult][]): void {
       r.mode === "unsafe" ? "no (no policy)" : r.outcome.attackAttempted ? mark(r.outcome.blockedByPolicy) : "n/a"
     )
   );
-  console.log(cells("Legitimate summary completed", (r) => mark(r.outcome.taskCompleted)));
+  console.log(cells("Page-grounded summary completed", (r) => mark(r.outcome.taskCompleted)));
 }
 
 main().catch((error) => {
