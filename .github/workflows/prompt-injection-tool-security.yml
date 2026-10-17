@@ -1,0 +1,33 @@
+name: Prompt Injection & Tool Security Module
+
+on:
+  pull_request:
+    paths:
+      - "13-prompt-injection-tool-security/**"
+      - ".github/workflows/prompt-injection-tool-security.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "13-prompt-injection-tool-security/**"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: 13-prompt-injection-tool-security
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: 13-prompt-injection-tool-security/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

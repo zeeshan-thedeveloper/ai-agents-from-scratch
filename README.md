@@ -135,6 +135,12 @@ This repo is the backbone of my **"AI Agents From Scratch"** LinkedIn series. Ea
 |---|---|
 | [durable-execution](./12-durable-execution/) | A checkpointed workflow survives a simulated crash, resumes from persisted state, and uses idempotency keys to avoid replaying side effects such as refunds. |
 
+### 13 — Prompt Injection & Tool Security
+
+| Pattern | What it demonstrates |
+|---|---|
+| [prompt-injection-tool-security](./13-prompt-injection-tool-security/) | An agent reads an attacker-controlled webpage containing malicious instructions. Compare vulnerable tool execution with an application-enforced security boundary that blocks unauthorized actions. |
+
 *More patterns coming — workflow orchestration, workers, and concurrency control.*
 
 ---
